@@ -1,216 +1,75 @@
 #![no_main]
 #![no_std]
 
-use core::slice;
+use uefi::{guid, prelude::*, println, Error, Guid};
+use uefi::boot::install_protocol_interface;
+use uefi::proto::unsafe_protocol;
 
-use uefi::{prelude::*, println, table::cfg::ACPI2_GUID, table::system_table_raw};
+const PROTO_GUID: Guid = guid!("9f01e43e-b2a1-4774-9ea8-a51ffd6d30fc");
 
-// Define the RSDP structure (Root System Description Pointer)
 #[derive(Debug)]
-#[repr(C, packed)]
-struct Rsdp {
-    signature: [u8; 8], // "RSD PTR "
-    checksum: u8,
-    oem_id: [u8; 6],
-    revision: u8, // For ACPI 2.0+, this is >= 2
-    rsdt_address: u32,
-    // Fields below are only valid for ACPI 2.0+
-    length: u32,
-    xsdt_address: u64,
-    extended_checksum: u8,
-    reserved: [u8; 3],
+#[repr(C)]
+pub struct MyProtocol {
+    pub test_fn: unsafe extern "efiapi" fn(this: *mut Self, input: i32, output: *mut i32) -> Status
 }
 
-// Define the common ACPI table header structure
-#[repr(C, packed)]
-struct AcpiTableHeader {
-    signature: [u8; 4],     // Table identifier
-    length: u32,            // Length of the table including header
-    revision: u8,           // Table revision
-    checksum: u8,           // Checksum for the entire table
-    oem_id: [u8; 6],        // OEM identifier
-    oem_table_id: [u8; 8],  // OEM table identifier
-    oem_revision: u32,      // OEM revision
-    creator_id: [u8; 4],    // Vendor ID
-    creator_revision: u32,  // Vendor revision
-}
-
-// Define the XSDT structure (Extended System Description Table)
-#[repr(C, packed)]
-struct Xsdt {
-    header: AcpiTableHeader,
-    // Followed by array of 64-bit physical addresses
-    // entries: [u64; N] - dynamically sized
-}
-
-/// Calculates the ACPI checksum for a given slice of bytes.
-/// The checksum is valid if the sum of all bytes in the table == 0 (mod 256).
-/// This function calculates the value that *should* be in the checksum field
-/// assuming the checksum field itself is currently 0.
-fn calculate_checksum(data: &[u8]) -> u8 {
-    let mut sum: u8 = 0;
-    for byte in data {
-        sum = sum.wrapping_add(*byte);
+impl MyProtocol {
+    /// test_fn takes an integer i and returns i * i
+    pub unsafe extern "efiapi" fn test_fn(_this: *mut Self, input: i32, output: *mut i32) -> Status {
+        if output.is_null() {
+            return Status::INVALID_PARAMETER;
+        }
+        unsafe {
+            *output = input * input;
+        }
+        Status::SUCCESS
     }
-    // We want sum + checksum == 0 (mod 256)
-    // So, checksum = -sum (mod 256)
-    sum.wrapping_neg()
 }
 
+#[unsafe_protocol(PROTO_GUID)]
+pub struct MyProtocolInterface(MyProtocol);
+
+impl MyProtocolInterface {
+    pub fn test_fn(&mut self, input: i32) -> Result<i32, Error> {
+        let mut output: i32 = 0;
+        let status = unsafe { (self.0.test_fn)(&mut self.0, input, &mut output) };
+        status.to_result_with_val(|| output)
+    }
+    
+}
 
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
-    let system_table = system_table_raw().expect("System table should be available");
-    let system_table = unsafe { system_table.as_ref() };
-    println!("Hello world from uefi-rust!");
-    println!("UEFI Version: {}", uefi::system::uefi_revision());
-    //println!("System Table: {:?}", system_table);
 
-    // Search for ACPI tables
-    let config_tables = system_table.configuration_table;
-    let config_tables = unsafe {
-        slice::from_raw_parts(
-            config_tables,
-            system_table.number_of_configuration_table_entries,
+    println!("Hello from UEFI!");
+
+    let my_protocol = MyProtocol {
+        test_fn: MyProtocol::test_fn,
+    };
+
+    let result = unsafe {
+        install_protocol_interface(
+            None,
+            &PROTO_GUID,
+            &my_protocol as *const _ as *const _
         )
     };
-    println!("Searching for ACPI tables...");
-    println!("Number of configuration tables: {}", config_tables.len());
 
-    // Use filter and map to find the ACPI 2.0+ entry
-    let acpi2_table = config_tables
-        .iter()
-        .find(|entry| entry.vendor_guid == ACPI2_GUID)
-        .map(|entry| entry.vendor_table);
+    let handle = result.unwrap();
 
-    let rsdp_ptr = acpi2_table.unwrap();
+    println!("Protocol installed with handle: {:?}", handle);   // seems to always be Handle(0x7e1b1f98)
 
-    println!("Found ACPI 2.0+ table at address: {:p}", rsdp_ptr);
+    let mut opened_protocol = boot::open_protocol_exclusive::<MyProtocolInterface>(handle).unwrap();
 
-    // Cast the vendor_table pointer to RSDP
-    let rsdp = unsafe { &*(rsdp_ptr as *const Rsdp) };
+    let input = 5;
+    let mut output: i32 = 0;
+    let status = unsafe { (opened_protocol.0.test_fn)(&mut opened_protocol.0, input, &mut output) };
 
-    // Check if the RSDP revision is less than 2
-    if rsdp.revision < 2 {
-        println!("ERROR: RSDP version less than 2 is not supported.");
-        return Status::UNSUPPORTED;
+    match status {
+        Status::SUCCESS => println!("test_fn({}): {}", input, output),
+        _ => println!("Failed to call test_fn: {:?}", status),
     }
-
-    // Print RSDP info
-    println!("RSDP Information:");
-    println!("  Physical Address: {:#018x}", rsdp_ptr as u64);
-    println!("  Length: {}", rsdp.length as usize);
-    let oem_id = str::from_utf8(&rsdp.oem_id).unwrap_or("Invalid");
-    println!("  OEM ID: {}", oem_id);
-    println!("  Checksum: {:#04x}", rsdp.checksum);
-    println!("  Revision: {}", rsdp.revision);
-    println!("  XSDT Address: {:#018x}", rsdp.xsdt_address as usize);
-    println!();
-
-    // Access the XSDT
-    let xsdt = unsafe { &*(rsdp.xsdt_address as *const Xsdt) };
-
-    // Print XSDT info
-    println!("XSDT Information:");
-    println!("  Physical Address: {:#018x}", rsdp.xsdt_address as usize);
-    println!("  Length: {}", xsdt.header.length as usize);
-
-    let xsdt_oem_id = str::from_utf8(&xsdt.header.oem_id).unwrap_or("Invalid OEM ID");
-    println!("  OEM ID: {}", xsdt_oem_id);
-    println!("  Checksum: {:#04x}", xsdt.header.checksum);
-
-    // Calculate number of entries in XSDT
-    let num_entries = (xsdt.header.length as usize - core::mem::size_of::<AcpiTableHeader>()) / 8;
-    println!("  Number of Table Entries: {}", num_entries);
-    println!();
-
-    // Get pointer to the first entry in XSDT
-    let entries_base_addr = rsdp.xsdt_address as usize + core::mem::size_of::<AcpiTableHeader>();
-
-    // Iterate through each table entry
-    println!("ACPI Tables:");
-    for i in 0..num_entries {
-        // Calculate address of the current entry
-        let entry_addr = entries_base_addr + (i * 8);
-
-        // Read the entry using unaligned access
-        let table_addr = unsafe {
-            core::ptr::read_unaligned(entry_addr as *const u64)
-        };
-
-        // Access the table header
-        let table_header = unsafe { &mut *(table_addr as *mut AcpiTableHeader) };
-
-        // Extract the 4-byte signature as a string
-        let sig_bytes = table_header.signature;
-        let sig = str::from_utf8(&sig_bytes).unwrap_or("????");
-
-        // Get current OEM ID and Checksum
-        let oem_id_bytes = table_header.oem_id; // Copy OEM ID
-        let current_oem_id = str::from_utf8(&oem_id_bytes).unwrap_or("Invalid");
-        let current_checksum = table_header.checksum;
-        let table_len = table_header.length;
-
-        println!("Table #{}:", i + 1);
-        println!("  Signature: {}", sig);
-        println!("  Physical Address: {:#018x}", table_addr);
-        println!("  Length: {}", table_len);
-        println!("  OEM ID: {}", current_oem_id);
-        println!("  Checksum: {:#04x}", current_checksum);
-
-        // --- Check current table checksum ---
-        let current_table_bytes = unsafe {slice::from_raw_parts(table_addr as *const u8, table_len as usize)};
-        if calculate_checksum(current_table_bytes) != 0 {
-            println!("  WARNING: Existing checksum is invalid!");
-        } else {
-            println!("  Checksum Verification: OK");
-        }
-
-
-        // --- Modification Logic ---
-        if &sig_bytes == b"FACP" { // Target the FACP table
-            println!("  -> Found target table FACP!");
-
-            // Define the new OEM ID (must be 6 bytes)
-            let new_oem_id: &[u8; 6] = b"HACKED"; // Use a byte literal slice
-
-            println!("  -> Modifying OEM ID from '{}' to '{}'", current_oem_id, str::from_utf8(new_oem_id).unwrap());
-
-            // --- Update the OEM ID in the table header ---
-            table_header.oem_id.copy_from_slice(new_oem_id);
-
-            // --- Recalculate Checksum ---
-            // 1. Temporarily set the checksum field to 0
-            println!("  -> Recalculating checksum...");
-            let original_checksum = table_header.checksum; // Just for logging
-            table_header.checksum = 0;
-
-            // 2. Get a slice of the entire table's data (now with modified OEM ID and zeroed checksum)
-            let table_bytes_for_checksum = unsafe {
-                slice::from_raw_parts(table_addr as *const u8, table_len as usize)
-            };
-
-            // 3. Calculate the new checksum value
-            let new_checksum = calculate_checksum(table_bytes_for_checksum);
-            println!("  -> Original Checksum: {:#04x}, New Checksum: {:#04x}", original_checksum, new_checksum);
-
-            // 4. Write the new checksum back into the header
-            table_header.checksum = new_checksum;
-
-            // 5. Verify the *new* checksum (optional sanity check)
-            let final_table_bytes = unsafe {slice::from_raw_parts(table_addr as *const u8, table_len as usize)};
-            if calculate_checksum(final_table_bytes) == 0 {
-                println!("  -> New checksum verification: OK");
-            } else {
-                println!("  -> ERROR: Failed to verify new checksum!");
-                // Consider restoring original state or returning an error if critical
-            }
-        }
-        println!(); // Blank line between tables
-    }
-
-    println!("ACPI table scan and modification attempt complete.");
 
     Status::SUCCESS
 }
