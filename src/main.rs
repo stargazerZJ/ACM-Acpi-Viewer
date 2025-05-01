@@ -43,6 +43,21 @@ struct Xsdt {
     // entries: [u64; N] - dynamically sized
 }
 
+/// Calculates the ACPI checksum for a given slice of bytes.
+/// The checksum is valid if the sum of all bytes in the table == 0 (mod 256).
+/// This function calculates the value that *should* be in the checksum field
+/// assuming the checksum field itself is currently 0.
+fn calculate_checksum(data: &[u8]) -> u8 {
+    let mut sum: u8 = 0;
+    for byte in data {
+        sum = sum.wrapping_add(*byte);
+    }
+    // We want sum + checksum == 0 (mod 256)
+    // So, checksum = -sum (mod 256)
+    sum.wrapping_neg()
+}
+
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -50,7 +65,7 @@ fn main() -> Status {
     let system_table = unsafe { system_table.as_ref() };
     println!("Hello world from uefi-rust!");
     println!("UEFI Version: {}", uefi::system::uefi_revision());
-    println!("System Table: {:?}", system_table);
+    //println!("System Table: {:?}", system_table);
 
     // Search for ACPI tables
     let config_tables = system_table.configuration_table;
@@ -86,9 +101,7 @@ fn main() -> Status {
     println!("RSDP Information:");
     println!("  Physical Address: {:#018x}", rsdp_ptr as u64);
     println!("  Length: {}", rsdp.length as usize);
-
-    // Convert OEM ID bytes to string
-    let oem_id = str::from_utf8(&rsdp.oem_id).unwrap_or("Invalid OEM ID");
+    let oem_id = str::from_utf8(&rsdp.oem_id).unwrap_or("Invalid");
     println!("  OEM ID: {}", oem_id);
     println!("  Checksum: {:#04x}", rsdp.checksum);
     println!("  Revision: {}", rsdp.revision);
@@ -127,22 +140,77 @@ fn main() -> Status {
         };
 
         // Access the table header
-        let table_header = unsafe { &*(table_addr as *const AcpiTableHeader) };
+        let table_header = unsafe { &mut *(table_addr as *mut AcpiTableHeader) };
 
         // Extract the 4-byte signature as a string
-        let sig = str::from_utf8(&table_header.signature).unwrap_or_else(|_| "????");
+        let sig_bytes = table_header.signature;
+        let sig = str::from_utf8(&sig_bytes).unwrap_or("????");
 
-        // Extract the OEM ID
-        let table_oem_id = str::from_utf8(&table_header.oem_id).unwrap_or_else(|_| "Invalid OEM ID");
+        // Get current OEM ID and Checksum
+        let oem_id_bytes = table_header.oem_id; // Copy OEM ID
+        let current_oem_id = str::from_utf8(&oem_id_bytes).unwrap_or("Invalid");
+        let current_checksum = table_header.checksum;
+        let table_len = table_header.length;
 
         println!("Table #{}:", i + 1);
         println!("  Signature: {}", sig);
         println!("  Physical Address: {:#018x}", table_addr);
-        println!("  Length: {}", table_header.length as usize);
-        println!("  OEM ID: {}", table_oem_id);
-        println!("  Checksum: {:#04x}", table_header.checksum);
-        println!();
+        println!("  Length: {}", table_len);
+        println!("  OEM ID: {}", current_oem_id);
+        println!("  Checksum: {:#04x}", current_checksum);
+
+        // --- Check current table checksum ---
+        let current_table_bytes = unsafe {slice::from_raw_parts(table_addr as *const u8, table_len as usize)};
+        if calculate_checksum(current_table_bytes) != 0 {
+            println!("  WARNING: Existing checksum is invalid!");
+        } else {
+            println!("  Checksum Verification: OK");
+        }
+
+
+        // --- Modification Logic ---
+        if &sig_bytes == b"FACP" { // Target the FACP table
+            println!("  -> Found target table FACP!");
+
+            // Define the new OEM ID (must be 6 bytes)
+            let new_oem_id: &[u8; 6] = b"HACKED"; // Use a byte literal slice
+
+            println!("  -> Modifying OEM ID from '{}' to '{}'", current_oem_id, str::from_utf8(new_oem_id).unwrap());
+
+            // --- Update the OEM ID in the table header ---
+            table_header.oem_id.copy_from_slice(new_oem_id);
+
+            // --- Recalculate Checksum ---
+            // 1. Temporarily set the checksum field to 0
+            println!("  -> Recalculating checksum...");
+            let original_checksum = table_header.checksum; // Just for logging
+            table_header.checksum = 0;
+
+            // 2. Get a slice of the entire table's data (now with modified OEM ID and zeroed checksum)
+            let table_bytes_for_checksum = unsafe {
+                slice::from_raw_parts(table_addr as *const u8, table_len as usize)
+            };
+
+            // 3. Calculate the new checksum value
+            let new_checksum = calculate_checksum(table_bytes_for_checksum);
+            println!("  -> Original Checksum: {:#04x}, New Checksum: {:#04x}", original_checksum, new_checksum);
+
+            // 4. Write the new checksum back into the header
+            table_header.checksum = new_checksum;
+
+            // 5. Verify the *new* checksum (optional sanity check)
+            let final_table_bytes = unsafe {slice::from_raw_parts(table_addr as *const u8, table_len as usize)};
+            if calculate_checksum(final_table_bytes) == 0 {
+                println!("  -> New checksum verification: OK");
+            } else {
+                println!("  -> ERROR: Failed to verify new checksum!");
+                // Consider restoring original state or returning an error if critical
+            }
+        }
+        println!(); // Blank line between tables
     }
+
+    println!("ACPI table scan and modification attempt complete.");
 
     Status::SUCCESS
 }
