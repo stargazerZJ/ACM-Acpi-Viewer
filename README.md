@@ -16,7 +16,7 @@
    │       ├── acpi-hacker.efi   # symlink to compiled binary
    │       └── startup.nsh
    ├── ubuntu-cloud
-   │   ├── ubuntu.img
+   │   └── ubuntu.img
    └── ACM-Acpi-Viewer
        └── README.md  # this project
    ```
