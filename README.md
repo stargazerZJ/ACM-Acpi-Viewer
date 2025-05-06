@@ -2,6 +2,18 @@
 
 [Lab 1.3](https://github.com/peterzheng98/os-2024-tutorial) of SJTU CS2952 Operating System.
 
+## Implementation Details
+
+UEFI services are defined in the UEFI specification so there is no standard way to add a custom UEFI runtime service and use it in Linux.
+
+On the rust side, we build a UEFI runtime driver, a kind of EFI program that gets executed when loaded, and it's code persists in memory even after OS take over.
+
+The UEFI runtime driver defines the function to be executed using inline assembly (I tried rust functions but failed), and then store the function pointer as a UEFI variable.
+
+On the Linux side, we first acquire the function pointer by reading the variable using UEFI runtime services. Then we set up proper memory mapping and permission.
+
+Afterward, we add a new sysfs entry `/sys/firmware/efi/my_service/my_service` to the kernel, which is a file that can be read and written. The kernel module will read the function pointer from the UEFI variable and execute it when the file is written.
+
 ## Quick Start
 
 1. Setup qemu and other dependencies according to [tutorial](https://github.com/peterzheng98/os-2024-tutorial/releases/tag/v1.26).
